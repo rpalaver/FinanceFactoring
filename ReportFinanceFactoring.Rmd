@@ -1,0 +1,563 @@
+---
+title: "Report for finance factoring prediction"
+author: "Reinhard Palaver"
+date: "13 4 2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE,warning=FALSE,message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(data.table)
+library(dslabs)
+library(dplyr)
+library(gridExtra)
+library(lubridate)
+library(gplots)
+library(imputeTS)
+```
+
+
+## Introduction
+
+In following report we are talking about predictions for finance factoring based on a dataset from Kaggle.
+
+The dataset we are using is a set of invoice data, with additional information about the customers and the situation for each single invoice, like how long it lasts to settle the invoice and whether the invoice was disputed or not, etc.
+
+This dataset was choosen, because it is quite good related to my working experience as a CFO and furthermore consultant in the area of accounting and controlling.
+
+The main goals in this project are two. 
+
+First we try to predict, whether the invoices will be settled late or not. Let us say the payment or settling of the open invoices will be later than due date. With such information an accouting office is able to clarifiy and check beforehand the open and maybe critical invoices, just to avoid late settlements. 
+
+And on the other hand we try to figure out the expected payments for the open invoices on a timeline. With such information we are able to check our cash flow situation for every single day in the future.
+
+Here we are documenting the analysis and presents the findings, with supporting statistics and figures.
+
+## Dataset
+
+The original dataset we are using is called "Factoring data from IBM" and are downloaded from Kaggle and 1:1 stored at my GitHub-Repository:
+
+https://raw.githubusercontent.com/rpalaver/FinanceFactoring/master/WA_Fn-UseC_-Accounts-Receivable.csv
+
+In our dataset we have 2.466 invoices from the year 2012 and 2013 and the whole number of customers are 100.
+
+```{r load csv-file, echo=FALSE}
+df <- read.csv("https://raw.githubusercontent.com/rpalaver/FinanceFactoring/master/WA_Fn-UseC_-Accounts-Receivable.csv", stringsAsFactors = FALSE)
+```
+
+After loading the data we have to convert the data into different formats for better reading and working on it.
+
+```{r convert data}
+# convert invoice date from character to format date
+df$PaperlessDate <- as.Date(df$PaperlessDate, "%m/%d/%Y")
+df$InvoiceDate <- as.Date(df$InvoiceDate, "%m/%d/%Y")
+df$DueDate <- as.Date(df$DueDate, "%m/%d/%Y")
+df$SettledDate <- as.Date(df$SettledDate, "%m/%d/%Y")
+
+# convert some variables to factors
+df$countryCode <- as.factor(df$countryCode)
+df$customerID <- as.factor(df$customerID)
+df$Disputed <- as.factor(df$Disputed)
+df$PaperlessBill <- as.factor(df$PaperlessBill)
+
+```
+
+
+
+For better reading we split each row into two parts.The first part of data looks like this:
+```{r show data first part, echo=FALSE}
+df %>% select(invoiceNumber, customerID, countryCode, InvoiceAmount, InvoiceDate, DueDate, PaperlessBill) %>% slice(1:10) %>% knitr::kable()
+```
+
+And the rest of informations for the same invoices looks like this:
+```{r show second part of origin daabase, echo=FALSE}
+df %>% select(invoiceNumber, Disputed, SettledDate, DaysToSettle, DaysLate, PaperlessDate) %>% slice(1:10) %>% knitr::kable()
+```
+
+Next step will be to split the whole dataset into a training and a validation dataset.
+
+```{r split dataset, warning=FALSE,message=FALSE}
+# Validation set will be 20% of df
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = df$DaysLate, times = 1, p = 0.2, list = FALSE)
+train_set <- df[-test_index,]
+temp <- df[test_index,]
+
+# Make sure customerID in validation set are also in  set
+test_set <- temp %>% 
+  semi_join(train_set, by = "customerID")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, test_set)
+train_set <- rbind(train_set, removed)
+
+rm(df, test_index, temp, removed)
+```
+
+## Analysis
+
+Before starting the analysis and a better understanding of all further figures we add a simple variable named **Late**. This variable determines, whether the settlement of invoice was too late or not.
+
+```{r add variable for late payment yes/no}
+train_set <- train_set %>% mutate(Late = ifelse(DaysLate > 0, 1,0))
+test_set  <- test_set  %>% mutate(Late = ifelse(DaysLate > 0, 1,0))
+```
+
+The first thing we compute is the proportion of late settlements:
+
+```{r proportion of overall late settlements, echo=FALSE}
+cat(mean(train_set$Late))
+```
+
+So to say about one-third of all inovices are late.
+
+And for all other invoices which are late, we are having decreasing number of invoices all the more **DaysLate** is  increasing.
+
+```{r show distribution of different DaysLate, echo=FALSE}
+train_set %>% group_by(DaysLate) %>% summarize(number=n()) %>% filter(DaysLate > 0) %>%
+ggplot(aes(DaysLate, number), xlab = "days too late") + geom_point() +
+  xlab("days too late") +
+  ylab("Number of invoices")
+```
+
+
+Next we have a look for the distribution of the variable **InvoiceAmount**.
+
+```{r plot distribution of invoice ammounts, echo=FALSE}
+qplot(train_set$InvoiceAmount, bins = 30, color = I("black"), xlab = "Invoice amount", ylab = "Number of invoices")
+```
+
+The variable **InvoiceAmpount** shows us a quite perfect normally distribution.
+
+Now we have a look for the variable **DaysToSettle**.
+
+```{r plot distribution of days to settle, echo=FALSE}
+qplot(train_set$DaysToSettle, bins = 30, color = I("black"), 
+      xlab = "Days to settle", ylab = "Number of invoices") +
+  geom_vline(xintercept = 30, show.legend = "due date", linetype = "longdash", color = "Red", size = 1.5) +
+  annotate("text", x = 30, y = 50, label = "payment target = 30", angle = 90, color = "White", vjust = 1.5)
+```
+
+We see a left squewed distribution lefthand from the general payment target of 30 days.
+
+As a very interesting variable we are analysing **PaperlessBill**. This information tells us, whether this invoice was sent by paper or on electronic way (e.g. eMail, EDI, ...).
+
+In all following figures we work with a percentage of *"in time"* and *"to late"* and distinguish between different categories, like here *"Electronic"* and *"Paper"*. 
+
+```{r show percentage in time and late splited regarding PaperlessBill, echo=FALSE}
+train_set %>% mutate(payment = ifelse(Late == 1,"to late", "in time")) %>%
+  ggplot(aes(payment, group = PaperlessBill)) + 
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+  scale_fill_manual("Late", values = c("seagreen3", "tomato2")) +
+  scale_y_continuous(labels=scales::percent) +
+  ylab("relative frequencies") +
+  facet_grid(~PaperlessBill) +
+  labs(y = "Percentage", title = "Paperless yes or no") +
+  theme(legend.position = "none")
+```
+
+We see that **PaperlessBill** is significant regarding late payments!
+
+Next we'll have a look for **Disputed** yes or no.
+
+```{r show percentage in time and late splitted regarding Disputed, echo=FALSE}
+train_set %>% mutate(payment = ifelse(Late == 1,"to late", "in time")) %>%
+  ggplot(aes(payment, group = Disputed)) + 
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+  scale_fill_manual("Late", values = c("seagreen3", "tomato2")) +
+  scale_y_continuous(labels=scales::percent) +
+  ylab("relative frequencies") +
+  facet_grid(~Disputed) +
+  labs(y = "Percentage", title = "Disputed yes or no") +
+  theme(legend.position = "none")
+```
+
+Here we do have a higher signifaction and this variable could be important to our following estimations.
+
+Let us have a look at the impact of the different **countryCode**.
+
+```{r show percentage in time and late splitted regarding country, echo=FALSE}
+train_set %>% mutate(payment = ifelse(Late == 1,"to late", "in time")) %>%
+  ggplot(aes(payment, group = countryCode)) + 
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+  scale_fill_manual("Late", values = c("seagreen3", "tomato2")) +
+  scale_y_continuous(labels=scales::percent) +
+  ylab("relative frequencies") +
+  facet_grid(~countryCode) +
+  labs(y = "Percentage", title = "Country situation") +
+  theme(legend.position = "none")
+```
+
+The main impact is coming from the **countryCode** 391. All others are more or less similiar.
+
+After all we take the variable **InvoiceDate** and group these quarterly.
+
+```{r show percentage in time and late splitted regarding quarterly invoice date, echo=FALSE}
+train_set %>% mutate(payment = ifelse(Late == 1,"1", "0")) %>%
+  mutate(quarter = quarter(InvoiceDate, with_year = FALSE)) %>%
+  ggplot(aes(payment, group = quarter)) + 
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+  scale_fill_manual("Late", values = c("seagreen3", "tomato2")) +
+  scale_y_continuous(labels=scales::percent) +
+  ylab("relative frequencies") +
+  facet_grid(~quarter) +
+  labs(y = "Percentage", title = "Invoice quarter situation") +
+  theme(legend.position = "none")
+```
+
+If we have a look at this figure we could assume that the customers are paying less invoices at the end of the year. During the year the willingness to pay is decreasing.
+
+### Summary ###
+
+These variables are important for our estimation.
+
+**countryCode**
+
+**InvoiceAmount**
+
+**PaperlessBill**
+
+**Disputed**
+
+**DaysToSettle**
+
+**DaysLate**
+
+**quarter**
+
+### Data wrangling
+
+As a additional predictor we take the training set and group the invoices by **customerID** and compute the percentage of **Late**. 
+
+Because we have a lot of different values at **InvoiceAmount** and **DaysLate** we stratify the amount into *small*, *medium* and *high* and **DaysToSettle** by 5. 
+
+Now we add all these information to the training and testing set by customerID with the function **"left_join"**.
+
+```{r data wrangling, warning=FALSE}
+# add variable for quarter
+train_set <- train_set %>% mutate(quarter = quarter(InvoiceDate, with_year = FALSE))
+test_set <- test_set %>% mutate(quarter = quarter(InvoiceDate, with_year = FALSE))
+
+# create a table grouped by customer to compute variables for mean of DaysToSettle, Late und DaysLate
+custTable <- train_set %>% group_by(customerID) %>% summarize(mu_DaysToSettle = mean(DaysToSettle),
+                                                              mu_Late = mean(Late),
+                                                              mu_DaysLate = mean(DaysLate))
+
+# stratify DaysToSettle
+custTable <- custTable %>% mutate(strat_DaysToSettle = round(mu_DaysToSettle/5)*5)
+
+# add values to train and test set
+train_set <- left_join(train_set, custTable, by = "customerID")
+test_set <- left_join(test_set, custTable, by = "customerID")
+rm(custTable)
+
+# stratify InvoiceAmount
+train_set <- train_set %>% mutate(Amount_bin = ifelse(InvoiceAmount < 20,"small", ifelse(InvoiceAmount > 100, "high", "medium")))
+test_set <- test_set %>% mutate(Amount_bin = ifelse(InvoiceAmount < 20,"small", ifelse(InvoiceAmount > 100, "high", "medium")))
+```
+
+### Correlation matrix
+
+Before we start with estimation we will have a look at the correlation of all variables:
+
+```{r correlation matrix, warning=FALSE}
+# create dataset from train set to plot correlation matrix
+corr_set <- train_set %>%
+  mutate(countryCode = as.numeric(countryCode), 
+  PaperlessBill = as.numeric(PaperlessBill),
+  Disputed = as.numeric(Disputed),
+  Amount_bin = as.numeric(factor(Amount_bin))) %>%
+  select(countryCode, PaperlessBill, Disputed, Amount_bin, strat_DaysToSettle, mu_Late, quarter)
+
+# compute correlations
+res <- cor(corr_set)
+
+# show correlation matrix
+heatmap.2(res
+          ,cellnote=round(res,2)
+          ,notecol = "black"
+          ,cexRow = 0.5
+          ,cexCol = 0.5
+          ,scale = "column"
+          ,col = RColorBrewer::brewer.pal(11, "Spectral")
+          ,main = "Correlation matrix"
+          ,Colv = NA
+          ,Rowv = NA
+          ,key = FALSE)
+```
+
+
+```{r remove res, echo=FALSE}
+rm(res, corr_set)
+```
+
+The correlations are not very significant except DaysToSettle and DaysLate, because DaysLate is a part of DaysToSettle. Therefore it will be a challenge getting high accuracy.
+
+
+## Train models to predict if a payment will be late  ##
+
+First of all we extract the relevant variables from both sets and copy it to two new sets called **train** and **test**.
+
+```{r prepare dataset, warning=FALSE}
+# prepare datasets for modeling and select predictors
+test <- test_set %>%  select(countryCode, PaperlessBill, Disputed, Amount_bin, strat_DaysToSettle, mu_Late, quarter)
+train <- train_set %>%  select(Late, countryCode, PaperlessBill, Disputed, Amount_bin, strat_DaysToSettle,mu_Late,
+                               quarter)
+train <- train %>% mutate(Late = as.factor(Late))
+```
+
+
+### Modeling
+
+We are using six different models for classification of **Late**: 
+
+- linear discriminant analysis (lda)
+- generalized linear model (glm)
+- recursive partitioning and regression rrees (rpart)
+- support vector machines with linear kernel (svmLinear)
+- k-nearest neighbors (knn)
+- generalized additive model using LOESS (gamLoess)
+
+We are not using the model *"random forest"* in this project because of runtime behavior. Outside this project I figured out that this model shows more or less the same result as the other models.
+
+```{r train models for classification, warning=FALSE, message=FALSE}
+# train different models
+models <- c("lda", "glm", "rpart","svmLinear", "knn", "gamLoess")
+set.seed(1, sample.kind = "Rounding")
+fits <- lapply(models, function(model){ 
+  print(model)
+  train(Late ~ ., method = model, data = train)
+})
+
+# predictions of different models
+pred <- sapply(fits, function(object) 
+  predict(object, newdata = test))
+colnames(pred) <- models
+```
+
+
+After running the different models we are creating an ensemble and add this estimate to our table of results.
+
+```{r create ensemble and add it, warning=FALSE}
+# create ensemble
+ensemble <- pred == 1
+ensemble_preds <- ifelse(rowMeans(ensemble) > 0.5, 1, 0)
+pred_new <- cbind.data.frame(pred, ensemble_preds)
+
+# compute accuracy of different models
+all_models <- c(models, "ensemble")
+n <- seq(1:length(all_models))
+
+# compute accuracy, sensitivity, specificity and prevalence
+accuracy <- sapply(n, function(object)
+  mean(pred_new[,object] == test_set$Late))
+
+sensitivity <- sapply(n, function(object)
+  confusionMatrix(factor(pred_new[,object]), reference = factor(test_set$Late))$byClass["Sensitivity"])
+
+specificity <- sapply(n,function(object)
+  confusionMatrix(factor(pred_new[,object]), reference = factor(test_set$Late))$byClass["Specificity"])
+
+data.frame(Model = all_models, Accuracy = accuracy, Sensitivity = sensitivity,
+           Specificity = specificity) %>% knitr::kable()
+
+
+```
+
+
+```{r compute prevalence, echo=FALSE}
+confusionMatrix(factor(pred_new[,1]), reference = factor(test_set$Late))$byClass["Prevalence"]
+rm(pred, pred_new, n, all_models, ensemble_preds, ensemble, accuracy, sensitivity, specificity, models)
+```
+
+The best result we receive is coming from **svmLinear**, but they are all very close. The key figures **Sensitivity** and **Specificity** are pretty good and the **Prevalence** seems to be good.
+
+For further information we may have a look at the importance of variables from some selected models:
+
+```{r variable importance, warning=FALSE}
+# extract important variables from different models
+glm <- varImp(fits[[2]])$importance
+glm <- rownames_to_column(glm)
+rpart <- varImp(fits[[3]])$importance
+rpart <- rownames_to_column(rpart)
+gam <- varImp(fits[[6]])$importance
+gam <- rownames_to_column(gam)
+
+# create table to compare different importance
+variables <- data.frame(rowname = glm[,1])
+variables <- left_join(variables, glm, by = "rowname")
+variables <- left_join(variables, rpart, by = "rowname")
+variables <- left_join(variables, gam, by = "rowname")
+colnames(variables) <- c("variables","glm", "rpart", "gamLoess")
+options(digits = 2)
+variables %>% knitr::kable()
+```
+
+```{r remove some variables, echo=FALSE}
+rm(fits,variables, glm, rpart, gam)
+```
+
+Now we know, that the variables **Disputed**, **mu_Late** and **stratified days to settle** depending on the model do have the most impact on our estimations.
+
+### Conclusion
+
+Therefore all models are very close and our origin dataset is quite "small", we do not achieve a higher accuracy. A second reason for that is, that we don't have a high number of invoices per customer.
+At the end I suggest to work with the ensemble and check time by time the behavior of the different models for ajdusting variables and models.
+
+
+
+## Train models to predict expected payments
+
+In this chapter we try to figure out the expected payments for the open invoices at a timeline. The prediction is based on the variable **DaysToSettle**. 
+
+With such information we are able to check our cash flow situation for every single day in the future.
+
+But here we will do a regression instead of a classification at the previous chapter.
+
+Once more we copy the variables from both sets and copy it to two new sets called **train** and **test**. But in this case we are taking **all** variables. 
+
+```{r prepare datasets for modeling and select predictors}
+test <- test_set %>%  select(countryCode, customerID, InvoiceAmount, PaperlessBill, Disputed, Amount_bin, 
+                             mu_DaysToSettle, mu_DaysLate, strat_DaysToSettle, mu_Late, quarter)
+train <- train_set %>%  select(DaysToSettle, countryCode, customerID, InvoiceAmount, PaperlessBill, Disputed,
+                               Amount_bin, mu_DaysToSettle, mu_DaysLate, strat_DaysToSettle, mu_Late, quarter)
+```
+
+### Modeling
+
+We are using five different models for regression of **DayToSettle**: 
+
+- linear models (lm)
+- recursive partitioning and regression rrees (rpart)
+- support vector machines with linear kernel (svmLinear)
+- k-nearest neighbors (knn)
+- generalized additive model using LOESS (gamLoess)
+
+And once more we are not using the model *"random forest"* in this project because of runtime behavior. Outside this project I have done it and the result of this model has been more or less the same as the other models.
+
+```{r train models for regression, warning=FALSE}
+# train different models
+models <- c("lm", "rpart","svmLinear", "knn", "gamLoess")
+set.seed(1, sample.kind = "Rounding")
+fits <- lapply(models, function(model){ 
+  print(model)
+  train(DaysToSettle ~ ., method = model, data = train)
+})
+
+# predictions of different models
+pred <- sapply(fits, function(object) 
+  predict(object, newdata = test))
+```
+
+For comparison reason we add two dates computed by **InvoiceDate** plus *payment target* and **InvoiceDate** plus overall average of **DaysToSettle**.
+
+```{r add cols for target and mean, warning=FALSE}
+# add columns for mean of DaysToSettle and payment target for comparison reason
+target <- rep(c(30), times = nrow(test_set))
+mean_DaysToSettle <- rep(c(mean(train_set$DaysToSettle)), times = nrow(test_set))
+comparisons <- c(models, "target", "mean")
+pred_new <- cbind.data.frame(pred, target, mean_DaysToSettle)
+colnames(pred_new) <- comparisons
+```
+
+To find out which model fits best, we are working with the keyfigure **RMSE** (root mean square deviation):
+
+```{r compute RMSE}
+# compute RMSE for all col's
+n <- seq(1:length(comparisons))
+rmse <- sapply(n, function(num){
+  RMSE(test_set$DaysToSettle, pred_new[,num])
+})
+
+data.frame(comparisons, rmse)[order(rmse),] %>% knitr::kable()
+```
+
+The **RMSE** from model **"lm"** is the best comparing to all others, specially if we compare it to the payment target or the average of days for settlement of an invoice.
+
+```{r remove data, echo=FALSE}
+rm(fits, comparisons, rmse, target, mean_DaysToSettle, models)
+```
+
+To visualize the differences we are building a table based on the payments coming from the different models. 
+```{r create table for monthtly cash income, warning=FALSE, message=FALSE}
+# create table with payment dates for different estimates comparing to true payment day
+# round predicted days
+pred_new <- round(pred_new)
+
+# convert days to dates and add true settledDate
+pred_date <- cbind.data.frame(true = as.numeric(test_set$SettledDate), as.numeric(test_set$InvoiceDate) + pred_new)
+
+# convert dates to periods
+n <- seq(1:ncol(pred_date))
+periods <- sapply(n, function(num)
+  format(as.Date(pred_date[,num], origin="1970-01-01"), "%Y-%m"))
+colnames(periods) <- names(pred_date)
+
+# add amount to table
+periods <- cbind.data.frame(Amount = test_set$InvoiceAmount,periods)
+
+# create timeline
+timeline <- gather(periods, key = "Amount") %>% group_by(value) %>% summarize()
+colnames(timeline) <- "period"
+
+# create datasets for 4 estimations
+true_pay <- periods[,1:2] %>% group_by(true) %>% summarize(x = sum(Amount))
+colnames(true_pay) <- c("period", "true_payment")
+lm_pay <- periods[,c(1,3)] %>% group_by(lm) %>% summarize(x = sum(Amount))
+colnames(lm_pay) <- c("period", "lm_payment")
+target_pay <- periods[,c(1,8)] %>% group_by(target) %>% summarize(x = sum(Amount))
+colnames(target_pay) <- c("period", "target_payment")
+mean_pay <- periods[,c(1,9)] %>% group_by(mean) %>% summarize(x = sum(Amount))
+colnames(mean_pay) <- c("period", "mean_payment")
+
+# create table by left_join
+cash_Table <- left_join(timeline, true_pay, by = "period")
+cash_Table <- left_join(cash_Table, lm_pay, by = "period")
+cash_Table <- left_join(cash_Table, target_pay, by = "period")
+cash_Table <- left_join(cash_Table, mean_pay, by = "period")
+
+# set 0 for na's
+cash_Table[is.na(cash_Table)] <- 0
+
+# compute differences 
+cash_Table <- cash_Table %>% mutate(diff_lm = (lm_payment - true_payment),
+                                   diff_target = (target_payment - true_payment),
+                                   diff_mean = (mean_payment - true_payment))
+# show table
+cash_Table %>% knitr::kable()
+```
+
+Compare overview:
+
+```{r overview, warning=FALSE}
+# compare min and max differences
+max <- apply(X = cash_Table[,6:8], MARGIN = 2, FUN = max, na.rm = TRUE)
+min <- apply(X = cash_Table[,6:8], MARGIN = 2, FUN = min, na.rm = TRUE)
+overview <- rbind.data.frame(max, min)
+colnames(overview) <- c("diff true to lm", "diff true to target", "diff true to mean")
+rownames(overview) <- c("highest positive difference in one month", "highest negative difference in one month")
+
+# show overview
+overview %>% knitr::kable()
+```
+
+Ratio of differences:
+
+```{r show ratio of differences based on average monthly cash income}
+options(digits = 4)
+deviation <- overview/mean(cash_Table$true_payment)*100 
+deviation %>% knitr::kable()
+```
+
+```{r remove rest, echo=FALSE}
+rm(pred_new, pred_date, n, periods, timeline, true_pay, lm_pay, target_pay, mean_pay, cash_Table, 
+   pred, max, min, overview, deviation)
+```
+
+The ratio shows us, that our differences per month are more than the halve of the other estimations.
+
+### Conclusion
+
+Our predictions are not so bad comparing to simple estimations like payment target. But for use in practive and better reliability we need more data and estimations.
